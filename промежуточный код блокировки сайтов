@@ -1,0 +1,432 @@
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <windows.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <ctime>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <algorithm>
+
+#pragma comment(lib, "ws2_32.lib")
+
+static const int BLOCK_DURATION_SEC = 24 * 60 * 60;
+static const int CHECK_INTERVAL_SEC = 60;
+static const char* DATA_FILE = "blocked_sites.dat";
+
+struct BlockedSite {
+    std::string domain;
+    std::vector<std::string> ips;
+    time_t blockedAt;
+};
+
+static std::vector<BlockedSite> g_blockedSites;
+static std::mutex g_mutex;
+static std::atomic<bool> g_running{ true };
+
+static std::string GetDataFilePath() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    std::string dir(path);
+    size_t pos = dir.find_last_of("\\/");
+    if (pos != std::string::npos)
+        dir = dir.substr(0, pos + 1);
+    return dir + DATA_FILE;
+}
+
+static std::string GetCurrentTimeStr() {
+    time_t now = time(nullptr);
+    struct tm t;
+    localtime_s(&t, &now);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+    return std::string(buf);
+}
+
+static std::string TimeToStr(time_t tt) {
+    struct tm t;
+    localtime_s(&t, &tt);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+    return std::string(buf);
+}
+
+static std::string MakeRuleName(const std::string& domain, const std::string& ip) {
+    return "SiteBlocker_" + domain + "_" + ip;
+}
+
+static std::vector<std::string> ResolveDomain(const std::string& domain) {
+    std::vector<std::string> result;
+
+    struct addrinfo hints{}, * res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(domain.c_str(), nullptr, &hints, &res) != 0)
+        return result;
+
+    for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        char ipStr[INET6_ADDRSTRLEN]{};
+        if (p->ai_family == AF_INET) {
+            struct sockaddr_in* addr = (struct sockaddr_in*)p->ai_addr;
+            inet_ntop(AF_INET, &addr->sin_addr, ipStr, sizeof(ipStr));
+        }
+        else if (p->ai_family == AF_INET6) {
+            struct sockaddr_in6* addr = (struct sockaddr_in6*)p->ai_addr;
+            inet_ntop(AF_INET6, &addr->sin6_addr, ipStr, sizeof(ipStr));
+        }
+        std::string ip(ipStr);
+        if (!ip.empty() &&
+            std::find(result.begin(), result.end(), ip) == result.end()) {
+            result.push_back(ip);
+        }
+    }
+    freeaddrinfo(res);
+    return result;
+}
+
+static bool RunCommand(const std::string& cmd) {
+    std::string full = cmd + " >nul 2>&1";
+    return system(full.c_str()) == 0;
+}
+
+static bool AddFirewallRule(const std::string& domain, const std::string& ip) {
+    std::string name = MakeRuleName(domain, ip);
+    std::string cmd = "netsh advfirewall firewall add rule name=\""
+        + name + "\" dir=out action=block remoteip=" + ip + " enable=yes";
+    return RunCommand(cmd);
+}
+
+static bool RemoveFirewallRule(const std::string& domain, const std::string& ip) {
+    std::string name = MakeRuleName(domain, ip);
+    std::string cmd = "netsh advfirewall firewall delete rule name=\"" + name + "\"";
+    return RunCommand(cmd);
+}
+
+static void SaveData() {
+    std::ofstream f(GetDataFilePath());
+    if (!f.is_open()) return;
+
+    for (auto& site : g_blockedSites) {
+        f << site.domain << "|" << site.blockedAt;
+        for (auto& ip : site.ips)
+            f << "|" << ip;
+        f << "\n";
+    }
+}
+
+static void LoadData() {
+    std::ifstream f(GetDataFilePath());
+    if (!f.is_open()) return;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+
+        std::istringstream ss(line);
+        std::string token;
+        std::vector<std::string> parts;
+        while (std::getline(ss, token, '|'))
+            parts.push_back(token);
+
+        if (parts.size() < 2) continue;
+
+        BlockedSite site;
+        site.domain = parts[0];
+        site.blockedAt = (time_t)std::stoll(parts[1]);
+        for (size_t i = 2; i < parts.size(); i++)
+            site.ips.push_back(parts[i]);
+
+        g_blockedSites.push_back(site);
+    }
+}
+
+static void UnblockSite(BlockedSite& site) {
+    for (auto& ip : site.ips)
+        RemoveFirewallRule(site.domain, ip);
+    std::cout << "[" << GetCurrentTimeStr() << "] Разблокирован: " << site.domain << std::endl;
+}
+
+static bool BlockSite(const std::string& domain) {
+    for (auto& s : g_blockedSites) {
+        if (s.domain == domain) {
+            std::cout << "  Сайт \"" << domain << "\" уже заблокирован." << std::endl;
+            return false;
+        }
+    }
+
+    std::cout << "  Разрешение DNS для " << domain << "..." << std::endl;
+    std::vector<std::string> ips = ResolveDomain(domain);
+    if (ips.empty()) {
+        std::cout << "  Ошибка: не удалось разрешить домен \"" << domain << "\"." << std::endl;
+        return false;
+    }
+
+    std::cout << "  Найдено IP-адресов: " << ips.size() << std::endl;
+
+    BlockedSite site;
+    site.domain = domain;
+    site.ips = ips;
+    site.blockedAt = time(nullptr);
+
+    bool ok = true;
+    for (auto& ip : ips) {
+        if (AddFirewallRule(domain, ip)) {
+            std::cout << "  Заблокирован IP: " << ip << std::endl;
+        }
+        else {
+            std::cout << "  Ошибка блокировки IP: " << ip << std::endl;
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        g_blockedSites.push_back(site);
+        SaveData();
+        time_t unlockTime = site.blockedAt + BLOCK_DURATION_SEC;
+        std::cout << "[" << GetCurrentTimeStr() << "] Сайт \"" << domain
+            << "\" заблокирован на 24 часа." << std::endl;
+        std::cout << "  Разблокировка в: " << TimeToStr(unlockTime) << std::endl;
+    }
+    return ok;
+}
+
+static void ManualUnblock(const std::string& domain) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    auto it = std::find_if(g_blockedSites.begin(), g_blockedSites.end(),
+        [&](const BlockedSite& s) { return s.domain == domain; });
+
+    if (it == g_blockedSites.end()) {
+        std::cout << "  Сайт \"" << domain << "\" не найден в списке блокировки." << std::endl;
+        return;
+    }
+
+    UnblockSite(*it);
+    g_blockedSites.erase(it);
+    SaveData();
+}
+
+static void AutoUnblockThread() {
+    while (g_running) {
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            time_t now = time(nullptr);
+
+            auto it = g_blockedSites.begin();
+            while (it != g_blockedSites.end()) {
+                if (now - it->blockedAt >= BLOCK_DURATION_SEC) {
+                    UnblockSite(*it);
+                    it = g_blockedSites.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+            SaveData();
+        }
+
+        for (int i = 0; i < CHECK_INTERVAL_SEC && g_running; i++)
+            Sleep(1000);
+    }
+}
+
+static bool IsRunAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuth, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin != FALSE;
+}
+
+static void CleanupExpired() {
+    time_t now = time(nullptr);
+    auto it = g_blockedSites.begin();
+    while (it != g_blockedSites.end()) {
+        if (now - it->blockedAt >= BLOCK_DURATION_SEC) {
+            UnblockSite(*it);
+            it = g_blockedSites.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+    SaveData();
+}
+
+static void ShowMenu() {
+    std::cout << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "         SiteBlocker - Меню" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "  1. Заблокировать сайт(ы)" << std::endl;
+    std::cout << "  2. Список заблокированных сайтов" << std::endl;
+    std::cout << "  3. Разблокировать сайт вручную" << std::endl;
+    std::cout << "  4. Выход" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "Выберите действие: ";
+}
+
+static void ShowBlockedList() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_blockedSites.empty()) {
+        std::cout << "  Список блокировки пуст." << std::endl;
+        return;
+    }
+    time_t now = time(nullptr);
+    std::cout << std::endl;
+    for (size_t i = 0; i < g_blockedSites.size(); i++) {
+        auto& s = g_blockedSites[i];
+        int remaining = BLOCK_DURATION_SEC - (int)(now - s.blockedAt);
+        if (remaining < 0) remaining = 0;
+        int hours = remaining / 3600;
+        int mins = (remaining % 3600) / 60;
+        std::cout << "  " << (i + 1) << ". " << s.domain
+            << "  (заблокирован: " << TimeToStr(s.blockedAt)
+            << ", осталось: " << hours << "ч " << mins << "м)" << std::endl;
+        for (auto& ip : s.ips)
+            std::cout << "     IP: " << ip << std::endl;
+    }
+}
+
+static bool InitWinsock() {
+    WSADATA wsaData;
+    return WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
+}
+
+int main() {
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+
+    std::cout << "========================================" << std::endl;
+    std::cout << "  SiteBlocker v1.0" << std::endl;
+    std::cout << "  Блокировка сайтов на 24 часа" << std::endl;
+    std::cout << "  Метод: брандмауэр Windows" << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    if (!IsRunAsAdmin()) {
+        std::cout << std::endl;
+        std::cout << "  ОШИБКА: Программа должна быть запущена" << std::endl;
+        std::cout << "  от имени администратора!" << std::endl;
+        std::cout << "  Нажмите Enter для выхода..." << std::endl;
+        std::cin.get();
+        return 1;
+    }
+
+    if (!InitWinsock()) {
+        std::cout << "  Ошибка инициализации сети." << std::endl;
+        return 1;
+    }
+
+    LoadData();
+    CleanupExpired();
+
+    if (!g_blockedSites.empty()) {
+        std::cout << std::endl;
+        std::cout << "  Загружено активных блокировок: " << g_blockedSites.size() << std::endl;
+    }
+
+    std::thread bgThread(AutoUnblockThread);
+
+    while (true) {
+        ShowMenu();
+
+        std::string choice;
+        std::getline(std::cin, choice);
+
+        if (choice == "1") {
+            std::cout << std::endl;
+            std::cout << "  Введите домен(ы) для блокировки" << std::endl;
+            std::cout << "  (через пробел, например: vk.com youtube.com):" << std::endl;
+            std::cout << "  > ";
+
+            std::string input;
+            std::getline(std::cin, input);
+
+            std::istringstream iss(input);
+            std::string domain;
+            std::vector<std::string> domains;
+            while (iss >> domain)
+                domains.push_back(domain);
+
+            if (domains.empty()) {
+                std::cout << "  Не указано ни одного домена." << std::endl;
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for (auto& d : domains) {
+                if (d.find("://") != std::string::npos)
+                    d = d.substr(d.find("://") + 3);
+                while (!d.empty() && d.back() == '/')
+                    d.pop_back();
+
+                std::string withoutWww = d;
+                std::string withWww = d;
+                if (d.substr(0, 4) == "www.")
+                    withoutWww = d.substr(4);
+                else
+                    withWww = "www." + d;
+
+                std::cout << std::endl;
+                BlockSite(withoutWww);
+                BlockSite(withWww);
+            }
+        }
+        else if (choice == "2") {
+            ShowBlockedList();
+        }
+        else if (choice == "3") {
+            std::cout << std::endl;
+            std::cout << "  Введите домен для разблокировки: ";
+            std::string domain;
+            std::getline(std::cin, domain);
+            if (!domain.empty()) {
+                if (domain.find("://") != std::string::npos)
+                    domain = domain.substr(domain.find("://") + 3);
+                while (!domain.empty() && domain.back() == '/')
+                    domain.pop_back();
+
+                std::string withoutWww = domain;
+                std::string withWww = domain;
+                if (domain.substr(0, 4) == "www.")
+                    withoutWww = domain.substr(4);
+                else
+                    withWww = "www." + domain;
+
+                ManualUnblock(withoutWww);
+                ManualUnblock(withWww);
+            }
+        }
+        else if (choice == "4") {
+            std::cout << std::endl;
+            std::cout << "  Завершение работы..." << std::endl;
+            std::cout << "  Блокировки остаются активными." << std::endl;
+            std::cout << "  Они будут сняты автоматически при следующем запуске" << std::endl;
+            std::cout << "  программы по истечении 24 часов." << std::endl;
+            break;
+        }
+        else {
+            std::cout << "  Неверный выбор." << std::endl;
+        }
+    }
+
+    g_running = false;
+    if (bgThread.joinable())
+        bgThread.join();
+
+    WSACleanup();
+    return 0;
+}
+
